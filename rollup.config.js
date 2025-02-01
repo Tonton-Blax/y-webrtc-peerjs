@@ -73,10 +73,10 @@ const plugins = [
 
 export default [
   {
-    input: './demo/index.js',
+    input: './demo/test-peerjs.js',
     output: [{
       name: 'demo',
-      file: 'dist/demo.js',
+      file: 'dist/demo-peerjs.js',
       format: 'iife',
       sourcemap: true
     }],

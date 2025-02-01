@@ -13,7 +13,7 @@ import * as math from 'lib0/math'
 import { createMutex } from 'lib0/mutex'
 
 import * as Y from 'yjs' // eslint-disable-line
-import Peer from 'simple-peer/simplepeer.min.js'
+import Peer from 'peerjs'
 
 import * as syncProtocol from 'y-protocols/sync'
 import * as awarenessProtocol from 'y-protocols/awareness'
@@ -146,7 +146,7 @@ const readPeerMessage = (peerConn, buf) => {
 const sendWebrtcConn = (webrtcConn, encoder) => {
   log('send message to ', logging.BOLD, webrtcConn.remotePeerId, logging.UNBOLD, logging.GREY, ' (', webrtcConn.room.name, ')', logging.UNCOLOR)
   try {
-    webrtcConn.peer.send(encoding.toUint8Array(encoder))
+    webrtcConn.conn.send(encoding.toUint8Array(encoder))
   } catch (e) {}
 }
 
@@ -158,7 +158,7 @@ const broadcastWebrtcConn = (room, m) => {
   log('broadcast message in ', logging.BOLD, room.name, logging.UNBOLD)
   room.webrtcConns.forEach(conn => {
     try {
-      conn.peer.send(m)
+      conn.conn.send(m)
     } catch (e) {}
   })
 }
@@ -174,28 +174,49 @@ export class WebrtcConn {
     log('establishing connection to ', logging.BOLD, remotePeerId)
     this.room = room
     this.remotePeerId = remotePeerId
-    this.glareToken = undefined
     this.closed = false
     this.connected = false
     this.synced = false
-    /**
-     * @type {import('simple-peer').Instance}
-     */
-    this.peer = new Peer({ initiator, ...room.provider.peerOpts })
-    this.peer.on('signal', signal => {
-      if (this.glareToken === undefined) {
-        // add some randomness to the timestamp of the offer
-        this.glareToken = Date.now() + Math.random()
+    /** @type {number|undefined} */
+    this.glareToken = undefined
+
+    /** @type {import('peerjs').Peer} */
+    this.peer = new Peer(room.peerId, room.provider.peerOpts)
+
+    /** @type {import('peerjs').DataConnection} */
+    this.conn = null
+
+    this.peer.on('open', (id) => {
+      log('PeerJS connection opened with ID:', id)
+      if (initiator) {
+        // If we're the initiator, connect to the remote peer
+        this.conn = this.peer.connect(remotePeerId, {
+          reliable: true,
+          serialization: 'json'
+        })
+        this.setupConnection()
       }
-      publishSignalingMessage(signalingConn, room, { to: remotePeerId, from: room.peerId, type: 'signal', token: this.glareToken, signal })
     })
-    this.peer.on('connect', () => {
-      log('connected to ', logging.BOLD, remotePeerId)
+
+    this.peer.on('connection', /** @param {import('peerjs').DataConnection} conn */ (conn) => {
+      this.conn = conn
+      this.setupConnection()
+    })
+
+    this.peer.on('error', err => {
+      log('Error in connection to ', logging.BOLD, remotePeerId, ': ', err)
+      announceSignalingInfo(room)
+    })
+  }
+
+  setupConnection () {
+    this.conn.on('open', () => {
+      log('connected to ', logging.BOLD, this.remotePeerId)
       this.connected = true
       // send sync step 1
-      const provider = room.provider
+      const provider = this.room.provider
       const doc = provider.doc
-      const awareness = room.awareness
+      const awareness = this.room.awareness
       const encoder = encoding.createEncoder()
       encoding.writeVarUint(encoder, messageSync)
       syncProtocol.writeSyncStep1(encoder, doc)
@@ -208,37 +229,53 @@ export class WebrtcConn {
         sendWebrtcConn(this, encoder)
       }
     })
-    this.peer.on('close', () => {
+
+    /**
+     * @param {unknown} data
+     */
+    this.conn.on('data', data => {
+      // PeerJS serializes the data, so we need to ensure it's an ArrayBuffer or Uint8Array
+      if (data instanceof ArrayBuffer) {
+        const answer = readPeerMessage(this, new Uint8Array(data))
+        if (answer !== null) {
+          sendWebrtcConn(this, answer)
+        }
+      } else if (data instanceof Uint8Array) {
+        const answer = readPeerMessage(this, data)
+        if (answer !== null) {
+          sendWebrtcConn(this, answer)
+        }
+      } else {
+        console.error('Received invalid data type:', data)
+      }
+    })
+
+    this.conn.on('close', () => {
       this.connected = false
       this.closed = true
-      if (room.webrtcConns.has(this.remotePeerId)) {
-        room.webrtcConns.delete(this.remotePeerId)
-        room.provider.emit('peers', [{
+      if (this.room.webrtcConns.has(this.remotePeerId)) {
+        this.room.webrtcConns.delete(this.remotePeerId)
+        this.room.provider.emit('peers', [{
           removed: [this.remotePeerId],
           added: [],
-          webrtcPeers: Array.from(room.webrtcConns.keys()),
-          bcPeers: Array.from(room.bcConns)
+          webrtcPeers: Array.from(this.room.webrtcConns.keys()),
+          bcPeers: Array.from(this.room.bcConns)
         }])
       }
-      checkIsSynced(room)
-      this.peer.destroy()
-      log('closed connection to ', logging.BOLD, remotePeerId)
-      announceSignalingInfo(room)
-    })
-    this.peer.on('error', err => {
-      log('Error in connection to ', logging.BOLD, remotePeerId, ': ', err)
-      announceSignalingInfo(room)
-    })
-    this.peer.on('data', data => {
-      const answer = readPeerMessage(this, data)
-      if (answer !== null) {
-        sendWebrtcConn(this, answer)
-      }
+      checkIsSynced(this.room)
+      this.destroy()
+      log('closed connection to ', logging.BOLD, this.remotePeerId)
+      announceSignalingInfo(this.room)
     })
   }
 
   destroy () {
-    this.peer.destroy()
+    if (this.conn) {
+      this.conn.close()
+    }
+    if (this.peer) {
+      this.peer.destroy()
+    }
   }
 }
 
@@ -539,7 +576,7 @@ export class SignalingConn extends ws.WebsocketClient {
                   existingConn.glareToken = undefined
                 }
                 if (data.to === peerId) {
-                  map.setIfUndefined(webrtcConns, data.from, () => new WebrtcConn(this, false, data.from, room)).peer.signal(data.signal)
+                  map.setIfUndefined(webrtcConns, data.from, () => new WebrtcConn(this, false, data.from, room))
                   emitPeerChange()
                 }
                 break
@@ -560,13 +597,23 @@ export class SignalingConn extends ws.WebsocketClient {
 }
 
 /**
+ * @typedef {Object} PeerJsConfig
+ * @property {string} [host]
+ * @property {number} [port]
+ * @property {string} [path]
+ * @property {boolean} [secure]
+ * @property {Object} [config]
+ * @property {Array<RTCIceServer>} [config.iceServers]
+ */
+
+/**
  * @typedef {Object} ProviderOptions
  * @property {Array<string>} [signaling]
  * @property {string} [password]
  * @property {awarenessProtocol.Awareness} [awareness]
  * @property {number} [maxConns]
  * @property {boolean} [filterBcConns]
- * @property {import('simple-peer').SimplePeer['config']} [peerOpts]
+ * @property {PeerJsConfig} [peerOpts]
  */
 
 /**
@@ -592,21 +639,35 @@ export class WebrtcProvider extends ObservableV2 {
   /**
    * @param {string} roomName
    * @param {Y.Doc} doc
-   * @param {ProviderOptions?} opts
+   * @param {ProviderOptions} [opts]
    */
   constructor (
     roomName,
     doc,
-    {
-      signaling = ['wss://y-webrtc-eu.fly.dev'],
-      password = null,
-      awareness = new awarenessProtocol.Awareness(doc),
-      maxConns = 20 + math.floor(random.rand() * 15), // the random factor reduces the chance that n clients form a cluster
-      filterBcConns = true,
-      peerOpts = {} // simple-peer options. See https://github.com/feross/simple-peer#peer--new-peeropts
-    } = {}
+    opts
   ) {
     super()
+    // Set default options by merging with provided opts
+    const {
+      signaling = ['https://0.peerjs.com'],
+      password = null,
+      awareness = new awarenessProtocol.Awareness(doc),
+      maxConns = 20 + math.floor(random.rand() * 15),
+      filterBcConns = true,
+      peerOpts = {
+        host: '0.peerjs.com',
+        port: 443,
+        path: '/',
+        secure: true,
+        config: {
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:global.stun.twilio.com:3478' }
+          ]
+        }
+      }
+    } = opts || {}
+
     this.roomName = roomName
     this.doc = doc
     this.filterBcConns = filterBcConns
